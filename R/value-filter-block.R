@@ -91,202 +91,10 @@ new_value_filter_block <- function(
   state = list(columns = list()),
   ...
 ) {
-  state <- migrate_value_filter_state(state)
   blockr.core::new_transform_block(
-    # -- server ---------------------------------------------------------------
-    function(id, data) {
-      shiny::moduleServer(id, function(input, output, session) {
-        ns <- session$ns
-        r_state <- shiny::reactiveVal(state)
-
-        self_write <- new.env(parent = emptyenv())
-        self_write$active <- FALSE
-
-        # Send column metadata (names/labels/table) on data change. The
-        # per-column unique-value lists are NOT shipped here — they load
-        # lazily on first dropdown-open (see the request handler below). In
-        # dm mode this is what avoids paying N-tables x uniques at startup,
-        # and never collects a remote (e.g. DuckDB-backed) table.
-        shiny::observeEvent(data(), {
-          d <- data()
-          meta <- build_column_meta(d)
-          if (is.null(meta)) return()
-          session$sendCustomMessage(
-            "bi-filter-columns",
-            list(
-              id      = ns("filter_input"),
-              columns = meta$columns,
-              is_dm   = meta$is_dm
-            )
-          )
-          # Re-apply single-select rule against fresh data.
-          s <- enforce_single_rule(r_state(), d)
-          if (!identical(s, r_state())) {
-            self_write$active <- FALSE
-            r_state(s)
-          }
-        })
-
-        # The other half of the same observer discipline: `enforce_single_rule()`
-        # above derives the COLUMN SELECTION from `data()` and parks it in
-        # `r_state`; this derives the expression SHAPE (dm vs data frame, plus
-        # the per-column types that drive the value cast) and parks it here.
-        # Between them, `expr` below reads only reactiveVals and never `data()`.
-        #
-        # Why it matters: blockr.core skips re-evaluating a block only when the
-        # expression it is handed is the SAME OBJECT as last time (`same_ref()`,
-        # see blockr.core/R/block-server.R). `make_filter_block_expr()` builds
-        # with `bquote()`, which allocates a fresh call tree on every read, so
-        # an `expr` that depended on `data()` re-ran -- and re-evaluated this
-        # block plus everything downstream -- on every spurious upstream
-        # invalidation (blockr.dock's view switches churn the chain with
-        # byte-for-byte identical data). Keyed on a reactiveVal that only
-        # changes when the shape actually changes, `expr` is not invalidated by
-        # that churn and hands back its cached object. See
-        # blockr.cdex/dev/profiling-plan.md, "Settled" item 8.
-        #
-        # A deliberately SEPARATE reactiveVal from `r_state`: `r_state` is the
-        # JS-synced blob that round-trips to the client (sendCustomMessage /
-        # `self_write`), and this is a purely server-side derived decision.
-        #
-        # The failure branch MUST write an explicit "not ready" marker rather
-        # than skip the write: silently leaving the last good shape in place
-        # would make `expr` serve a STALE expression exactly where it has to
-        # propagate the upstream's silent stop, which blockr.core reads as
-        # "this block is waiting" (not "this block has output").
-        shape_rv <- shiny::reactiveVal(NULL)
-
-        shiny::observe({
-          shape_rv(
-            tryCatch(
-              # NB: a NULL / not-yet-ready upstream is a VALID shape, not a
-              # failure -- it builds the data-frame branch, which is the
-              # documented restore behaviour (see the note on `expr`).
-              list(ok = TRUE, shape = filter_input_shape(data())),
-              # An upstream `req()` / error must keep reaching blockr.core; it
-              # is captured here (an erroring observer would kill the session)
-              # and re-raised from `expr` below, unchanged.
-              error = function(e) list(ok = FALSE, cond = e)
-            )
-          )
-        })
-
-        # JS -> R: lazy value request for one column (fires on dropdown-open).
-        # `key` is the qualified key ("table.column" for a dm, bare column
-        # name otherwise); only that single column's values are computed.
-        shiny::observeEvent(input$filter_input_request_values, {
-          key <- input$filter_input_request_values
-          opts <- column_values(shiny::isolate(data()), key)
-          if (is.null(opts)) return()
-          session$sendCustomMessage(
-            "bi-filter-column-values",
-            list(id = ns("filter_input"), key = key, values = opts)
-          )
-        })
-
-        # JS -> R: the widget binding announced itself (fires from the
-        # binding's initialize(), every time the element is (re)bound). In a
-        # deferred dock panel the block's script arrives with the panel on
-        # FIRST VISIT — any push flushed before that had no registered
-        # handler and was dropped by Shiny outright, out of reach of the JS
-        # replay queue. Re-send column metadata and the current state on
-        # announce; the widget applies latest-wins, so the boot-path
-        # duplicate is harmless.
-        shiny::observeEvent(input$filter_input_ready, {
-          d <- tryCatch(data(), error = function(e) NULL)
-          meta <- build_column_meta(d)
-          if (!is.null(meta)) {
-            session$sendCustomMessage(
-              "bi-filter-columns",
-              list(
-                id      = ns("filter_input"),
-                columns = meta$columns,
-                  is_dm   = meta$is_dm
-              )
-            )
-          }
-          session$sendCustomMessage(
-            "bi-filter-update",
-            list(id    = ns("filter_input"),
-                 state = normalize_state_for_json(r_state()))
-          )
-        })
-
-        # JS -> R: user changed state.
-        shiny::observeEvent(input$filter_input, {
-          incoming <- migrate_value_filter_state(input$filter_input)
-          s <- enforce_single_rule(incoming, shiny::isolate(data()))
-          # Suppress the R->JS echo only when the server left the JS-sent state
-          # untouched. When enforce_single_rule fills a single-select default
-          # (the lazy widget can no longer prefill it client-side) or drops a
-          # stale entry, JS still holds the un-corrected state — so we MUST
-          # echo the correction back, or the widget shows an empty selection
-          # while the filter is silently applied.
-          self_write$active <- identical(s$columns, incoming$columns)
-          r_state(s)
-        })
-
-        # R -> JS: external control or server-side rewrite.
-        shiny::observeEvent(r_state(), {
-          if (self_write$active) {
-            self_write$active <- FALSE
-          } else {
-            session$sendCustomMessage(
-              "bi-filter-update",
-              list(id    = ns("filter_input"),
-                   state = normalize_state_for_json(r_state()))
-            )
-          }
-        })
-
-        list(
-          # NB: the expression *shape* depends on the input type — a data frame
-          # yields `dplyr::filter()`, a `dm` yields `dm::dm_filter()`, and value
-          # casting reads the column's type. So `expr` must track the input, NOT
-          # isolate it: on restore the upstream is often not ready yet (NULL), in
-          # which case the df branch is built; if the real input turns out to be
-          # a `dm`, evaluating that wrong-shaped expression errors until the
-          # value is re-edited. It tracks it through `shape_rv()` (see the
-          # observer above), never by reading `data()` here — that is what keeps
-          # the expression object stable across spurious upstream
-          # invalidations, so blockr.core's `same_ref()` skip check succeeds.
-          expr = shiny::reactive({
-            derived <- shape_rv()
-            shiny::req(derived)
-            # The upstream failed: re-raise its condition verbatim (a `req()`
-            # silent stop stays a silent stop, i.e. "waiting").
-            if (!isTRUE(derived$ok)) stop(derived$cond)
-            make_filter_expr_from_shape(
-              r_state()$columns %||% list(),
-              derived$shape,
-              operator = r_state()$operator %||% "&"
-            )
-          }),
-          state = list(state = r_state)
-        )
-      })
-    },
-    # -- ui -------------------------------------------------------------------
-    function(id) {
-      shiny::tagList(
-        blockr.dplyr::blockr_core_js_dep(),
-        blockr.dplyr::blockr_blocks_css_dep(),
-        blockr.dplyr::blockr_select_dep(),
-        value_filter_block_dep(),
-        shiny::div(
-          class = "block-container",
-          shiny::div(
-            id = shiny::NS(id, "filter_input"),
-            class = "bi-filter-container"
-          )
-        )
-      )
-    },
-    dat_valid = function(data) {
-      if (!is.data.frame(data) && !inherits(data, "dm")) {
-        stop("Input must be a data frame or a dm")
-      }
-    },
+    value_filter_server(migrate_value_filter_state(state), drill = FALSE),
+    value_filter_ui(drill = FALSE),
+    dat_valid = value_filter_dat_valid,
     class = "value_filter_block",
     expr_type = "bquoted",
     external_ctrl = TRUE,
@@ -294,6 +102,274 @@ new_value_filter_block <- function(
     ...
   )
 }
+
+# --- shared implementation ---------------------------------------------------
+#
+# `new_value_filter_block()` and `new_drill_filter_block()` are ONE block with
+# two receiving ends, so they share a server and a UI rather than a copy each.
+# The difference is `drill`: the drill target resolves an incoming claim's table
+# itself and reports a claim it cannot place. Everything else -- the state
+# shape, the widget, the lazy value loading, the expression discipline -- is the
+# same code.
+#
+# Two constructors and not one argument, because the whole point of the drill
+# target is that a board has exactly ONE and it can be found without being
+# named. `ctrl_targets()` looks blocks up BY CLASS, so the distinction has to be
+# in the class vector; a flag on the value filter would leave the sender
+# counting candidates again, which is the bug this exists to remove.
+#
+# They must also stay separate TOP-LEVEL constructors: `new_transform_block()`
+# records the ctor from `sys.parent()`, so a wrapper delegating to the other
+# constructor would serialize as that one, and a saved board would restore a
+# drill filter as a plain value filter.
+
+#' @noRd
+value_filter_dat_valid <- function(data) {
+  if (!is.data.frame(data) && !inherits(data, "dm")) {
+    stop("Input must be a data frame or a dm")
+  }
+}
+
+#' The block server, shared by the value filter and the drill filter.
+#'
+#' @param state The migrated filter state.
+#' @param drill Resolve an incoming claim's dm table, and report one that
+#'   cannot be placed. `TRUE` only for [new_drill_filter_block()].
+#' @noRd
+value_filter_server <- function(state, drill = FALSE) {
+  function(id, data) {
+    shiny::moduleServer(id, function(input, output, session) {
+      ns <- session$ns
+      r_state <- shiny::reactiveVal(state)
+
+      self_write <- new.env(parent = emptyenv())
+      self_write$active <- FALSE
+
+      # DRILL TARGET ONLY. A claim arriving over the control channel names a
+      # COLUMN and, on a dm, no table: the sender does not hold the data model,
+      # so it cannot know which table the column lives in. `make_dm_filter_expr()`
+      # SKIPS any entry whose table is empty, which means an unresolved claim is
+      # dropped without a word. Resolve it here, where the dm is, and say so
+      # when it cannot be resolved -- the derived-column case, e.g. a composer
+      # table claiming `DEATH` against a dm that only carries `DTHFL`.
+      r_drill_note <- shiny::reactiveVal(character())
+
+      # Send column metadata (names/labels/table) on data change. The
+      # per-column unique-value lists are NOT shipped here — they load
+      # lazily on first dropdown-open (see the request handler below). In
+      # dm mode this is what avoids paying N-tables x uniques at startup,
+      # and never collects a remote (e.g. DuckDB-backed) table.
+      shiny::observeEvent(data(), {
+        d <- data()
+        meta <- build_column_meta(d)
+        if (is.null(meta)) return()
+        session$sendCustomMessage(
+          "bi-filter-columns",
+          list(
+            id      = ns("filter_input"),
+            columns = meta$columns,
+            is_dm   = meta$is_dm
+          )
+        )
+        # Re-apply single-select rule against fresh data.
+        s <- enforce_single_rule(r_state(), d)
+        if (!identical(s, r_state())) {
+          self_write$active <- FALSE
+          r_state(s)
+        }
+      })
+
+      # The other half of the same observer discipline: `enforce_single_rule()`
+      # above derives the COLUMN SELECTION from `data()` and parks it in
+      # `r_state`; this derives the expression SHAPE (dm vs data frame, plus
+      # the per-column types that drive the value cast) and parks it here.
+      # Between them, `expr` below reads only reactiveVals and never `data()`.
+      #
+      # Why it matters: blockr.core skips re-evaluating a block only when the
+      # expression it is handed is the SAME OBJECT as last time (`same_ref()`,
+      # see blockr.core/R/block-server.R). `make_filter_block_expr()` builds
+      # with `bquote()`, which allocates a fresh call tree on every read, so
+      # an `expr` that depended on `data()` re-ran -- and re-evaluated this
+      # block plus everything downstream -- on every spurious upstream
+      # invalidation (blockr.dock's view switches churn the chain with
+      # byte-for-byte identical data). Keyed on a reactiveVal that only
+      # changes when the shape actually changes, `expr` is not invalidated by
+      # that churn and hands back its cached object. See
+      # blockr.cdex/dev/profiling-plan.md, "Settled" item 8.
+      #
+      # A deliberately SEPARATE reactiveVal from `r_state`: `r_state` is the
+      # JS-synced blob that round-trips to the client (sendCustomMessage /
+      # `self_write`), and this is a purely server-side derived decision.
+      #
+      # The failure branch MUST write an explicit "not ready" marker rather
+      # than skip the write: silently leaving the last good shape in place
+      # would make `expr` serve a STALE expression exactly where it has to
+      # propagate the upstream's silent stop, which blockr.core reads as
+      # "this block is waiting" (not "this block has output").
+      shape_rv <- shiny::reactiveVal(NULL)
+
+      shiny::observe({
+        shape_rv(
+          tryCatch(
+            # NB: a NULL / not-yet-ready upstream is a VALID shape, not a
+            # failure -- it builds the data-frame branch, which is the
+            # documented restore behaviour (see the note on `expr`).
+            list(ok = TRUE, shape = filter_input_shape(data())),
+            # An upstream `req()` / error must keep reaching blockr.core; it
+            # is captured here (an erroring observer would kill the session)
+            # and re-raised from `expr` below, unchanged.
+            error = function(e) list(ok = FALSE, cond = e)
+          )
+        )
+      })
+
+      # JS -> R: lazy value request for one column (fires on dropdown-open).
+      # `key` is the qualified key ("table.column" for a dm, bare column
+      # name otherwise); only that single column's values are computed.
+      shiny::observeEvent(input$filter_input_request_values, {
+        key <- input$filter_input_request_values
+        opts <- column_values(shiny::isolate(data()), key)
+        if (is.null(opts)) return()
+        session$sendCustomMessage(
+          "bi-filter-column-values",
+          list(id = ns("filter_input"), key = key, values = opts)
+        )
+      })
+
+      # JS -> R: the widget binding announced itself (fires from the
+      # binding's initialize(), every time the element is (re)bound). In a
+      # deferred dock panel the block's script arrives with the panel on
+      # FIRST VISIT — any push flushed before that had no registered
+      # handler and was dropped by Shiny outright, out of reach of the JS
+      # replay queue. Re-send column metadata and the current state on
+      # announce; the widget applies latest-wins, so the boot-path
+      # duplicate is harmless.
+      shiny::observeEvent(input$filter_input_ready, {
+        d <- tryCatch(data(), error = function(e) NULL)
+        meta <- build_column_meta(d)
+        if (!is.null(meta)) {
+          session$sendCustomMessage(
+            "bi-filter-columns",
+            list(
+              id      = ns("filter_input"),
+              columns = meta$columns,
+                is_dm   = meta$is_dm
+            )
+          )
+        }
+        session$sendCustomMessage(
+          "bi-filter-update",
+          list(id    = ns("filter_input"),
+               state = normalize_state_for_json(r_state()))
+        )
+      })
+
+      # JS -> R: user changed state.
+      shiny::observeEvent(input$filter_input, {
+        incoming <- migrate_value_filter_state(input$filter_input)
+        s <- enforce_single_rule(incoming, shiny::isolate(data()))
+        # Suppress the R->JS echo only when the server left the JS-sent state
+        # untouched. When enforce_single_rule fills a single-select default
+        # (the lazy widget can no longer prefill it client-side) or drops a
+        # stale entry, JS still holds the un-corrected state — so we MUST
+        # echo the correction back, or the widget shows an empty selection
+        # while the filter is silently applied.
+        self_write$active <- identical(s$columns, incoming$columns)
+        r_state(s)
+      })
+
+      # R -> JS: external control or server-side rewrite.
+      shiny::observeEvent(r_state(), {
+        if (self_write$active) {
+          self_write$active <- FALSE
+        } else {
+          session$sendCustomMessage(
+            "bi-filter-update",
+            list(id    = ns("filter_input"),
+                 state = normalize_state_for_json(r_state()))
+          )
+        }
+      })
+
+      # Resolution reads `shape_rv()` -- the cached 0-row templates plus the
+      # dm's primary keys -- and never `data()`, for the reason `expr` does not
+      # read it either: a claim is then re-resolved when the SHAPE changes, not
+      # on every upstream churn. Writing `r_state` from an observer that also
+      # reads it converges because resolution is idempotent: the second pass is
+      # `identical()` and stops there.
+      if (isTRUE(drill)) {
+
+        shiny::observe({
+
+          st <- r_state()
+          derived <- shape_rv()
+
+          if (is.null(derived) || !isTRUE(derived$ok)) {
+            return()
+          }
+
+          res <- resolve_claim_tables(st, derived$shape)
+          r_drill_note(res$unresolved)
+
+          if (!identical(res$state, st)) {
+            self_write$active <- FALSE
+            r_state(res$state)
+          }
+        })
+
+        output$drill_note <- shiny::renderUI(drill_note_ui(r_drill_note()))
+      }
+
+      list(
+        # NB: the expression *shape* depends on the input type — a data frame
+        # yields `dplyr::filter()`, a `dm` yields `dm::dm_filter()`, and value
+        # casting reads the column's type. So `expr` must track the input, NOT
+        # isolate it: on restore the upstream is often not ready yet (NULL), in
+        # which case the df branch is built; if the real input turns out to be
+        # a `dm`, evaluating that wrong-shaped expression errors until the
+        # value is re-edited. It tracks it through `shape_rv()` (see the
+        # observer above), never by reading `data()` here — that is what keeps
+        # the expression object stable across spurious upstream
+        # invalidations, so blockr.core's `same_ref()` skip check succeeds.
+        expr = shiny::reactive({
+          derived <- shape_rv()
+          shiny::req(derived)
+          # The upstream failed: re-raise its condition verbatim (a `req()`
+          # silent stop stays a silent stop, i.e. "waiting").
+          if (!isTRUE(derived$ok)) stop(derived$cond)
+          make_filter_expr_from_shape(
+            r_state()$columns %||% list(),
+            derived$shape,
+            operator = r_state()$operator %||% "&"
+          )
+        }),
+        state = list(state = r_state)
+      )
+    })
+  }
+}
+
+#' The block UI, shared by the value filter and the drill filter.
+#' @noRd
+value_filter_ui <- function(drill = FALSE) {
+  function(id) {
+    shiny::tagList(
+      blockr.dplyr::blockr_core_js_dep(),
+      blockr.dplyr::blockr_blocks_css_dep(),
+      blockr.dplyr::blockr_select_dep(),
+      value_filter_block_dep(),
+      shiny::div(
+        class = "block-container",
+        shiny::div(
+          id = shiny::NS(id, "filter_input"),
+          class = "bi-filter-container"
+        ),
+        if (isTRUE(drill)) shiny::uiOutput(shiny::NS(id, "drill_note"))
+      )
+    )
+  }
+}
+
 
 #' Migrate a pre-column-object filter state into the new column-object shape.
 #'
@@ -628,7 +704,11 @@ filter_input_shape <- function(data) {
     }
     return(list(
       is_dm  = TRUE,
-      tables = lapply(dm::dm_get_tables(data), table_head0)
+      tables = lapply(dm::dm_get_tables(data), table_head0),
+      # For the drill target only, and cheap: the key table is metadata the dm
+      # already holds, no query. It decides which table a claim goes to when
+      # several carry the column (see `claim_table_for()`).
+      pks    = dm_pk_map(data)
     ))
   }
   list(

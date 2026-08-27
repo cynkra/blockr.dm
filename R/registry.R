@@ -22,7 +22,8 @@ register_dm_blocks <- function() {
       "new_dm_temporal_join_block",
       "new_crossfilter_block",
       "new_dm_example_block",
-      "new_value_filter_block"
+      "new_value_filter_block",
+      "new_drill_filter_block"
     ),
     name = c(
       "Import multiple tables",
@@ -39,7 +40,8 @@ register_dm_blocks <- function() {
       "dm Temporal join",
       "Crossfilter",
       "Example data model",
-      "Value filter"
+      "Value filter",
+      "Drill filter"
     ),
     description = c(
       paste(
@@ -81,6 +83,11 @@ register_dm_blocks <- function() {
         "Minimal value filter for a data frame or dm.",
         "Columns hidden behind the gear; per-column single vs multi",
         "select. dm input cascades via FKs."
+      ),
+      paste(
+        "The value filter a drill-down click writes into. One per board,",
+        "beside blockr.viz's control bridge extension; senders find it by",
+        "class and it resolves a claimed column to a dm table itself."
       )
     ),
     category = c(
@@ -103,6 +110,7 @@ register_dm_blocks <- function() {
       "structured",
       "structured",
       "input",
+      "structured",
       "structured"
     ),
     icon = c(
@@ -120,7 +128,8 @@ register_dm_blocks <- function() {
       "clock-history",
       "lightning",
       "database",
-      "filter"
+      "filter",
+      "crosshair"
     ),
     guidance = c(
       # new_dm_read_block:
@@ -242,7 +251,19 @@ register_dm_blocks <- function() {
         "demos and testing \u2014 no file paths needed."
       ),
       # new_value_filter_block:
-      ""
+      "",
+      # new_drill_filter_block:
+      paste(
+        "The destination for cross-block drill-down claims. Put ONE on a",
+        "board together with blockr.viz::new_ctrl_bridge_extension() \u2014 the",
+        "two belong together: the bridge opens the control channel, this",
+        "block is what the channel writes into. A drilling chart / table /",
+        "tile then needs no ctrl_target, because senders resolve it by",
+        "class. Unlike a plain value filter it also fills in WHICH dm table",
+        "a claimed column belongs to, and reports a claim no table can take",
+        "instead of dropping it. Use plain new_value_filter_block() for",
+        "every other filtering job on the board."
+      )
     ),
     arguments = list(
       dm_read_arguments(),
@@ -259,6 +280,7 @@ register_dm_blocks <- function() {
       dm_temporal_join_arguments(),
       crossfilter_arguments(),
       dm_example_arguments(),
+      NULL,
       NULL
     ),
     package = utils::packageName(),

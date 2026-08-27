@@ -181,3 +181,32 @@
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+
+/* Drill filter: the line shown when a claim names a column no table in the dm
+   carries, so the filter could not apply it. Muted rather than alarming — it
+   reports a sender that claimed a derived column, which is a board-authoring
+   mistake, not a runtime failure. Absent (renders nothing) while every claim
+   resolves, so the drill filter looks exactly like a value filter until one
+   does not. */
+.drill-filter-note {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--blockr-color-border, #e5e7eb);
+  border-left: 3px solid var(--blockr-color-warning, #d97706);
+  border-radius: 6px;
+  background: var(--blockr-color-surface-muted, #f9fafb);
+}
+
+.drill-filter-note-head {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--blockr-color-text, #111827);
+}
+
+.drill-filter-note-hint {
+  font-size: 0.75rem;
+  color: var(--blockr-color-text-muted, #6b7280);
+}
