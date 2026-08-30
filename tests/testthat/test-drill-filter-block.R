@@ -338,3 +338,44 @@ test_that("resolving a claim does not loop", {
     args = list(x = block, data = list(data = function() drill_test_dm()))
   )
 })
+
+test_that("an untabled claim filters on the FIRST evaluation, not the second", {
+
+  # The prod flash. A claim lands over the control channel naming a column and
+  # no table -- the sender does not hold the data model, so it cannot. The
+  # state mod rebuilds the block's expression at once, and
+  # make_dm_filter_expr() skips untabled entries: evaluated as-is, the first
+  # expression let the WHOLE dm through, and the cohort showed every patient
+  # until the resolution observer's second pass caught up. Locally the two
+  # passes share a flush and the window never paints; on a deployed board they
+  # do not, and every re-aim of the drill flashed the full population.
+  #
+  # The expression builder therefore resolves inline, exactly as the server's
+  # expr reactive does: the first evaluation IS the narrowed one.
+  shape <- filter_input_shape(drill_test_dm())
+  st <- claim(name = "SEX", mode = "multi", values = "F")
+
+  # The window, pinned: unresolved, the expression is the no-op passthrough --
+  # the very expression an empty filter builds.
+  expect_equal(
+    make_filter_expr_from_shape(st$columns, shape),
+    make_filter_expr_from_shape(list(), shape)
+  )
+
+  # Resolved first -- what the server's expr reactive now does -- the same
+  # claim builds the same expression an explicitly-tabled claim builds: the
+  # first evaluation IS the narrowed one.
+  res <- resolve_claim_tables(st, shape)
+  expect_equal(
+    make_filter_expr_from_shape(res$state$columns, shape),
+    make_filter_expr_from_shape(
+      claim(name = "SEX", table = "adsl", mode = "multi", values = "F")$columns,
+      shape
+    )
+  )
+
+  # And the observer's later write is inert: resolving the resolved state is
+  # identical, so the second pass produces the same expression, not a second
+  # cohort.
+  expect_identical(resolve_claim_tables(res$state, shape)$state, res$state)
+})

@@ -337,10 +337,23 @@ value_filter_server <- function(state, drill = FALSE) {
           # The upstream failed: re-raise its condition verbatim (a `req()`
           # silent stop stays a silent stop, i.e. "waiting").
           if (!isTRUE(derived$ok)) stop(derived$cond)
+          st <- r_state()
+          # Resolve claim tables HERE, not only in the observer above. A claim
+          # lands untabled, the state mod rebuilds this expression at once, and
+          # make_dm_filter_expr() skips untabled entries -- so the first
+          # evaluation filtered NOTHING and the whole dm went downstream. The
+          # cohort showed every patient for one board evaluation until the
+          # observer's resolution pass caught up and narrowed it again: drill,
+          # flash to everyone, snap back, on every re-aim of a dm-backed drill.
+          # Resolving inline makes the first evaluation the right one; the
+          # observer still runs, but its write is then identical() and inert.
+          if (isTRUE(drill)) {
+            st <- resolve_claim_tables(st, derived$shape)$state
+          }
           make_filter_expr_from_shape(
-            r_state()$columns %||% list(),
+            st$columns %||% list(),
             derived$shape,
-            operator = r_state()$operator %||% "&"
+            operator = st$operator %||% "&"
           )
         }),
         state = list(state = r_state)
